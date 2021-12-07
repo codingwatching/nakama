@@ -393,8 +393,8 @@ func (rm *RuntimeJavaScriptMatchCore) MatchLoop(tick int64, state interface{}, i
 		msgMap := make(map[string]interface{}, 5)
 		msgMap["sender"] = presenceMap
 		msgMap["opCode"] = msg.OpCode
-		if msg.Data != nil {
-			msgMap["data"] = string(msg.Data)
+		if msg.Data == nil {
+			msgMap["data"] = goja.Null()
 		} else {
 			msgMap["data"] = goja.Null()
 		}
