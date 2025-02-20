@@ -234,7 +234,7 @@ func NewClient(logger *zap.Logger, timeout time.Duration, googleCnf *oauth2.Conf
 func (c *Client) GetFacebookProfile(ctx context.Context, accessToken string) (*FacebookProfile, error) {
 	c.logger.Debug("Getting Facebook profile", zap.String("token", accessToken))
 
-	path := "https://graph.facebook.com/v18.0/me?access_token=" + url.QueryEscape(accessToken) +
+	path := "https://graph.facebook.com/v22.0/me?access_token=" + url.QueryEscape(accessToken) +
 		"&fields=" + url.QueryEscape("id,name,email,picture")
 	var profile FacebookProfile
 	err := c.request(ctx, "facebook profile", path, nil, &profile)
@@ -253,7 +253,7 @@ func (c *Client) GetFacebookFriends(ctx context.Context, accessToken string) ([]
 	after := ""
 	for {
 		// In FB Graph API 2.0+ this only returns friends that also use the same app.
-		path := "https://graph.facebook.com/v18.0/me/friends?access_token=" + url.QueryEscape(accessToken)
+		path := "https://graph.facebook.com/v22.0/me/friends?access_token=" + url.QueryEscape(accessToken)
 		if after != "" {
 			path += "&after=" + after
 		}
@@ -805,7 +805,7 @@ func (c *Client) CheckFacebookLimitedLoginToken(ctx context.Context, appId strin
 		c.facebookMutex.Lock()
 		if c.facebookCertsRefreshAt < time.Now().UTC().Unix() {
 			var certs JwksCerts
-			err := c.request(ctx, "facebook cert", "https://www.facebook.com/.well-known/oauth/openid/jwks/", nil, &certs)
+			err := c.request(ctx, "facebook cert", "https://limited.facebook.com/.well-known/oauth/openid/jwks/", nil, &certs)
 			if err != nil {
 				c.facebookMutex.Unlock()
 				return nil, err
@@ -948,12 +948,11 @@ func (c *Client) request(ctx context.Context, provider, path string, headers map
 }
 
 func (c *Client) requestRaw(ctx context.Context, provider, path string, headers map[string]string) ([]byte, error) {
-	req, err := http.NewRequest("GET", path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		c.logger.Warn("error constructing social request", zap.String("provider", provider), zap.Error(err))
 		return nil, err
 	}
-	req = req.WithContext(ctx)
 	for k, v := range headers {
 		req.Header.Add(k, v)
 	}

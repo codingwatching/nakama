@@ -49,7 +49,6 @@ import (
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/internal/cronexpr"
 	lua "github.com/heroiclabs/nakama/v3/internal/gopher-lua"
-	"github.com/heroiclabs/nakama/v3/internal/satori"
 	"github.com/heroiclabs/nakama/v3/social"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -94,7 +93,7 @@ type RuntimeLuaNakamaModule struct {
 	satori runtime.Satori
 }
 
-func NewRuntimeLuaNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, once *sync.Once, localCache *RuntimeLuaLocalCache, storageIndex StorageIndex, matchCreateFn RuntimeMatchCreateFunction, eventFn RuntimeEventCustomFunction, registerCallbackFn func(RuntimeExecutionMode, string, *lua.LFunction), announceCallbackFn func(RuntimeExecutionMode, string)) *RuntimeLuaNakamaModule {
+func NewRuntimeLuaNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, version string, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, once *sync.Once, localCache *RuntimeLuaLocalCache, storageIndex StorageIndex, satoriClient runtime.Satori, matchCreateFn RuntimeMatchCreateFunction, eventFn RuntimeEventCustomFunction, registerCallbackFn func(RuntimeExecutionMode, string, *lua.LFunction), announceCallbackFn func(RuntimeExecutionMode, string)) *RuntimeLuaNakamaModule {
 	return &RuntimeLuaNakamaModule{
 		logger:               logger,
 		db:                   db,
@@ -126,14 +125,7 @@ func NewRuntimeLuaNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshale
 		matchCreateFn: matchCreateFn,
 		eventFn:       eventFn,
 
-		satori: satori.NewSatoriClient(
-			logger,
-			config.GetSatori().Url,
-			config.GetSatori().ApiKeyName,
-			config.GetSatori().ApiKey,
-			config.GetSatori().SigningKey,
-			config.GetSession().TokenExpirySec,
-		),
+		satori: satoriClient,
 	}
 }
 
@@ -313,6 +305,7 @@ func (n *RuntimeLuaNakamaModule) Loader(l *lua.LState) int {
 		"groups_list":                               n.groupsList,
 		"groups_get_random":                         n.groupsGetRandom,
 		"user_groups_list":                          n.userGroupsList,
+		"friend_metadata_update":                    n.friendMetadataUpdate,
 		"friends_list":                              n.friendsList,
 		"friends_of_friends_list":                   n.friendsOfFriendsList,
 		"friends_add":                               n.friendsAdd,
@@ -2982,10 +2975,18 @@ func (n *RuntimeLuaNakamaModule) usersGetFriendStatus(l *lua.LState) int {
 			return 0
 		}
 
-		ft := l.CreateTable(0, 3)
+		ft := l.CreateTable(0, 4)
 		ft.RawSetString("state", lua.LNumber(f.State.Value))
 		ft.RawSetString("update_time", lua.LNumber(f.UpdateTime.Seconds))
 		ft.RawSetString("user", fut)
+		metadataMap := make(map[string]interface{})
+		err = json.Unmarshal([]byte(f.Metadata), &metadataMap)
+		if err != nil {
+			l.RaiseError("failed to unmarshal friend metadata: %s", err.Error())
+			return 0
+		}
+		metadataTable := RuntimeLuaConvertMap(l, metadataMap)
+		ft.RawSetString("metadata", metadataTable)
 
 		userFriends.RawSetInt(i+1, ft)
 	}
@@ -7433,6 +7434,7 @@ func (n *RuntimeLuaNakamaModule) leaderboardRecordsListCursorFromRank(l *lua.LSt
 // @param score(type=number, optional=true, default=0) The score to submit.
 // @param subscore(type=number, optional=true, default=0) A secondary subscore parameter for the submission.
 // @param metadata(type=table, optional=true) The metadata you want associated to this submission. Some good examples are weather conditions for a racing game.
+// @param overrideOperator(type=number, optional=true) An override operator for the new record. The accepted values include: 0 (no override), 1 (best), 2 (set), 3 (incr), 4 (decr).
 // @return record(table) The newly created leaderboard record.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeLuaNakamaModule) leaderboardRecordWrite(l *lua.LState) int {
@@ -9926,10 +9928,18 @@ func (n *RuntimeLuaNakamaModule) friendsList(l *lua.LState) int {
 			return 0
 		}
 
-		ft := l.CreateTable(0, 3)
+		ft := l.CreateTable(0, 4)
 		ft.RawSetString("state", lua.LNumber(f.State.Value))
 		ft.RawSetString("update_time", lua.LNumber(f.UpdateTime.Seconds))
 		ft.RawSetString("user", fut)
+		metadataMap := make(map[string]interface{})
+		err = json.Unmarshal([]byte(f.Metadata), &metadataMap)
+		if err != nil {
+			l.RaiseError("failed to unmarshal friend metadata: %s", err.Error())
+			return 0
+		}
+		metadataTable := RuntimeLuaConvertMap(l, metadataMap)
+		ft.RawSetString("metadata", metadataTable)
 
 		userFriends.RawSetInt(i+1, ft)
 	}
@@ -10091,7 +10101,25 @@ func (n *RuntimeLuaNakamaModule) friendsAdd(l *lua.LState) int {
 	allIDs = append(allIDs, userIDs...)
 	allIDs = append(allIDs, fetchIDs...)
 
-	err = AddFriends(l.Context(), n.logger, n.db, n.tracker, n.router, userID, username, allIDs)
+	// Parse metadata, optional.
+	metadataTable := l.OptTable(5, nil)
+	var metadata map[string]any
+	if metadataTable != nil {
+		metadata = RuntimeLuaConvertLuaTable(metadataTable)
+	}
+
+	var metadataStr string
+	if metadata != nil {
+		bytes, err := json.Marshal(metadata)
+		if err != nil {
+			n.logger.Error("Could not marshal metadata", zap.Error(err))
+			l.RaiseError("error marshalling metadata: %s", err.Error())
+			return 0
+		}
+		metadataStr = string(bytes)
+	}
+
+	err = AddFriends(l.Context(), n.logger, n.db, n.tracker, n.router, userID, username, allIDs, metadataStr)
 	if err != nil {
 		l.RaiseError("error adding friends: %s", err.Error())
 		return 0
@@ -10294,6 +10322,35 @@ func (n *RuntimeLuaNakamaModule) friendsBlock(l *lua.LState) int {
 	err = BlockFriends(l.Context(), n.logger, n.db, n.tracker, userID, allIDs)
 	if err != nil {
 		l.RaiseError("error blocking friends: %s", err.Error())
+		return 0
+	}
+
+	return 0
+}
+
+// @group friends
+// @summary Update friend metadata.
+// @param userId(type=string) The ID of the user.
+// @param userIdFriend(type=string) The ID of the friend of the user.
+// @param metadata(type=table) The custom metadata to set for the friend.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeLuaNakamaModule) friendMetadataUpdate(l *lua.LState) int {
+	uid, err := uuid.FromString(l.CheckString(1))
+	if err != nil {
+		l.ArgError(1, "expects user ID to be a valid identifier")
+		return 0
+	}
+
+	fuid, err := uuid.FromString(l.CheckString(2))
+	if err != nil {
+		l.ArgError(2, "expects user ID to be a valid identifier")
+		return 0
+	}
+
+	metadata := RuntimeLuaConvertLuaTable(l.CheckTable(3))
+
+	if err := UpdateFriendMetadata(l.Context(), n.logger, n.db, uid, fuid, metadata); err != nil {
+		l.RaiseError("error updating friends metadata: %s", err.Error())
 		return 0
 	}
 
@@ -10872,6 +10929,7 @@ func (n *RuntimeLuaNakamaModule) getSatori(l *lua.LState) int {
 // @param id(type=string) The identifier of the identity.
 // @param defaultProperties(type=table, optional=true, default=nil) Default properties.
 // @param customProperties(type=table, optional=true, default=nil) Custom properties.
+// @param noSession(type=bool, optional=true, default=true) Whether authenticate should skip session tracking.
 // @param ip(type=string) Ip address.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeLuaNakamaModule) satoriAuthenticate(l *lua.LState) int {
@@ -10899,20 +10957,29 @@ func (n *RuntimeLuaNakamaModule) satoriAuthenticate(l *lua.LState) int {
 		}
 	}
 
-	ip := l.OptString(4, "")
+	noSession := l.OptBool(4, true)
 
-	if err := n.satori.Authenticate(l.Context(), identifier, defaultPropsMap, customPropsMap, ip); err != nil {
+	ip := l.OptString(5, "")
+
+	properties, err := n.satori.Authenticate(l.Context(), identifier, defaultPropsMap, customPropsMap, noSession, ip)
+	if err != nil {
 		l.RaiseError("failed to satori authenticate: %v", err.Error())
 		return 0
 	}
 
-	return 0
+	propertiesTable := l.CreateTable(0, 3)
+	propertiesTable.RawSetString("default", RuntimeLuaConvertMapString(l, properties.Default))
+	propertiesTable.RawSetString("custom", RuntimeLuaConvertMapString(l, properties.Custom))
+	propertiesTable.RawSetString("computed", RuntimeLuaConvertMapString(l, properties.Computed))
+
+	l.Push(propertiesTable)
+	return 1
 }
 
 // @group satori
 // @summary Get identity properties.
 // @param id(type=string) The identifier of the identity.
-// @return properties(type=table) The identity properties.
+// @return properties(table) The identity properties.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeLuaNakamaModule) satoriPropertiesGet(l *lua.LState) int {
 	identifier := l.CheckString(1)
@@ -11005,6 +11072,7 @@ func (n *RuntimeLuaNakamaModule) satoriPropertiesUpdate(l *lua.LState) int {
 // @summary Publish an event.
 // @param id(type=string) The identifier of the identity.
 // @param events(type=table) An array of events to publish.
+// @param ip(type=string) Ip address.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeLuaNakamaModule) satoriEventsPublish(l *lua.LState) int {
 	identifier := l.CheckString(1)
@@ -11090,7 +11158,9 @@ func (n *RuntimeLuaNakamaModule) satoriEventsPublish(l *lua.LState) int {
 		return 0
 	}
 
-	if err := n.satori.EventsPublish(l.Context(), identifier, events); err != nil {
+	ip := l.OptString(3, "")
+
+	if err := n.satori.EventsPublish(l.Context(), identifier, events, ip); err != nil {
 		l.RaiseError("failed to satori publish event: %v", err.Error())
 		return 0
 	}
