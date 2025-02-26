@@ -26,7 +26,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unique"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/heroiclabs/nakama-common/runtime"
@@ -47,9 +49,19 @@ type SatoriClient struct {
 	tokenExpirySec       int
 	nakamaTokenExpirySec int64
 	invalidConfig        bool
+
+	cacheEnabled          bool
+	flagsCacheMutex       sync.RWMutex
+	propertiesCacheMutex  sync.RWMutex
+	liveEventsCacheMutex  sync.RWMutex
+	experimentsCacheMutex sync.RWMutex
+	flagsCache            map[context.Context]map[string]flagCacheEntry
+	propertiesCache       map[context.Context]*runtime.Properties
+	liveEventsCache       map[context.Context]*runtime.LiveEventList
+	experimentsCache      map[context.Context]*runtime.ExperimentList
 }
 
-func NewSatoriClient(logger *zap.Logger, satoriUrl, apiKeyName, apiKey, signingKey string, nakamaTokenExpirySec int64) *SatoriClient {
+func NewSatoriClient(ctx context.Context, logger *zap.Logger, satoriUrl, apiKeyName, apiKey, signingKey string, nakamaTokenExpirySec int64, cacheEnabled bool) *SatoriClient {
 	parsedUrl, _ := url.Parse(satoriUrl)
 
 	sc := &SatoriClient{
@@ -62,6 +74,16 @@ func NewSatoriClient(logger *zap.Logger, satoriUrl, apiKeyName, apiKey, signingK
 		signingKey:           strings.TrimSpace(signingKey),
 		tokenExpirySec:       3600,
 		nakamaTokenExpirySec: nakamaTokenExpirySec,
+
+		cacheEnabled:          cacheEnabled,
+		flagsCacheMutex:       sync.RWMutex{},
+		propertiesCacheMutex:  sync.RWMutex{},
+		liveEventsCacheMutex:  sync.RWMutex{},
+		experimentsCacheMutex: sync.RWMutex{},
+		flagsCache:            make(map[context.Context]map[string]flagCacheEntry),
+		propertiesCache:       make(map[context.Context]*runtime.Properties),
+		liveEventsCache:       make(map[context.Context]*runtime.LiveEventList),
+		experimentsCache:      make(map[context.Context]*runtime.ExperimentList),
 	}
 
 	if sc.urlString == "" && sc.apiKeyName == "" && sc.apiKey == "" && sc.signingKey == "" {
@@ -69,6 +91,61 @@ func NewSatoriClient(logger *zap.Logger, satoriUrl, apiKeyName, apiKey, signingK
 	} else if err := sc.validateConfig(); err != nil {
 		sc.invalidConfig = true
 		logger.Warn(err.Error())
+	}
+
+	// NOTE: If the cache is enabled, any calls done within InitModule will remain cached for the lifetime of
+	// the server.
+	if sc.cacheEnabled {
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					go func() {
+						sc.flagsCacheMutex.Lock()
+						for cacheCtx := range sc.flagsCache {
+							if cacheCtx.Err() != nil {
+								delete(sc.flagsCache, cacheCtx)
+							}
+						}
+						sc.flagsCacheMutex.Unlock()
+					}()
+
+					go func() {
+						sc.propertiesCacheMutex.Lock()
+						for cacheCtx := range sc.propertiesCache {
+							if cacheCtx.Err() != nil {
+								delete(sc.propertiesCache, cacheCtx)
+							}
+						}
+						sc.propertiesCacheMutex.Unlock()
+					}()
+
+					go func() {
+						sc.liveEventsCacheMutex.Lock()
+						for cacheCtx := range sc.liveEventsCache {
+							if cacheCtx.Err() != nil {
+								delete(sc.liveEventsCache, cacheCtx)
+							}
+						}
+						sc.liveEventsCacheMutex.Unlock()
+					}()
+
+					go func() {
+						sc.experimentsCacheMutex.Lock()
+						for cacheCtx := range sc.experimentsCache {
+							if cacheCtx.Err() != nil {
+								delete(sc.experimentsCache, cacheCtx)
+							}
+						}
+						sc.experimentsCacheMutex.Unlock()
+					}()
+				}
+			}
+		}()
 	}
 
 	return sc
@@ -169,9 +246,10 @@ func (s *SatoriClient) generateToken(ctx context.Context, id string) (string, er
 }
 
 type authenticateBody struct {
-	Id      string            `json:"id"`
-	Default map[string]string `json:"default,omitempty"`
-	Custom  map[string]string `json:"custom,omitempty"`
+	Id        string            `json:"id"`
+	Default   map[string]string `json:"default,omitempty"`
+	Custom    map[string]string `json:"custom,omitempty"`
+	NoSession bool              `json:"no_session,omitempty"`
 }
 
 // @group satori
@@ -180,25 +258,32 @@ type authenticateBody struct {
 // @param id(type=string) The identifier of the identity.
 // @param default(type=map[string]string, optional=true, default=nil) Default properties to update with this call. Set to nil to leave them as they are on the server.
 // @param custom(type=map[string]string, optional=true, default=nil) Custom properties to update with this call. Set to nil to leave them as they are on the server.
+// @param noSession(type=bool) Whether authenticate should skip session duration tracking.
 // @param ipAddress(type=string, optional=true, default="") An optional client IP address to pass on to Satori for geo-IP lookup.
+// @return properties(*runtime.Properties)
 // @return error(error) An optional error value if an error occurred.
-func (s *SatoriClient) Authenticate(ctx context.Context, id string, defaultProperties, customProperties map[string]string, ipAddress ...string) error {
+func (s *SatoriClient) Authenticate(ctx context.Context, id string, defaultProperties, customProperties map[string]string, noSession bool, ipAddress ...string) (*runtime.Properties, error) {
 	if s.invalidConfig {
-		return runtime.ErrSatoriConfigurationInvalid
+		return nil, runtime.ErrSatoriConfigurationInvalid
 	}
 
 	url := s.url.String() + "/v1/authenticate"
 
-	body := &authenticateBody{Id: id, Default: defaultProperties, Custom: customProperties}
-
-	json, err := json.Marshal(body)
-	if err != nil {
-		return err
+	body := &authenticateBody{
+		Id:        id,
+		Default:   defaultProperties,
+		Custom:    customProperties,
+		NoSession: noSession,
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(json))
+	jsonBody, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth(s.apiKey, "")
@@ -209,45 +294,6 @@ func (s *SatoriClient) Authenticate(ctx context.Context, id string, defaultPrope
 	} else if ipAddr, ok := ctx.Value(runtime.RUNTIME_CTX_CLIENT_IP).(string); ok {
 		req.Header.Set("X-Forwarded-For", ipAddr)
 	}
-
-	res, err := s.httpc.Do(req)
-	if err != nil {
-		return err
-	}
-
-	defer res.Body.Close()
-
-	switch res.StatusCode {
-	case 200:
-		return nil
-	default:
-		return fmt.Errorf("%d status code", res.StatusCode)
-	}
-}
-
-// @group satori
-// @summary Get identity properties.
-// @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param id(type=string) The identifier of the identity.
-// @return properties(*runtime.Properties) The identity properties.
-// @return error(error) An optional error value if an error occurred.
-func (s *SatoriClient) PropertiesGet(ctx context.Context, id string) (*runtime.Properties, error) {
-	if s.invalidConfig {
-		return nil, runtime.ErrSatoriConfigurationInvalid
-	}
-
-	url := s.url.String() + "/v1/properties"
-
-	sessionToken, err := s.generateToken(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
 
 	res, err := s.httpc.Do(req)
 	if err != nil {
@@ -263,15 +309,84 @@ func (s *SatoriClient) PropertiesGet(ctx context.Context, id string) (*runtime.P
 			return nil, err
 		}
 
-		var props runtime.Properties
+		props := struct {
+			Properties runtime.Properties `json:"properties"`
+		}{
+			Properties: runtime.Properties{
+				Default:  map[string]string{},
+				Custom:   map[string]string{},
+				Computed: map[string]string{},
+			},
+		}
 		if err = json.Unmarshal(resBody, &props); err != nil {
 			return nil, err
 		}
 
-		return &props, nil
+		return &props.Properties, nil
 	default:
 		return nil, fmt.Errorf("%d status code", res.StatusCode)
 	}
+}
+
+// @group satori
+// @summary Get identity properties.
+// @param ctx(type=context.Context) The context object represents information about the server and requester.
+// @param id(type=string) The identifier of the identity.
+// @return properties(*runtime.Properties) The identity properties.
+// @return error(error) An optional error value if an error occurred.
+func (s *SatoriClient) PropertiesGet(ctx context.Context, id string) (*runtime.Properties, error) {
+	if s.invalidConfig {
+		return nil, runtime.ErrSatoriConfigurationInvalid
+	}
+
+	s.propertiesCacheMutex.RLock()
+	entry, found := s.propertiesCache[ctx]
+	s.propertiesCacheMutex.RUnlock()
+
+	if !found {
+		url := s.url.String() + "/v1/properties"
+
+		sessionToken, err := s.generateToken(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
+
+		res, err := s.httpc.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		defer res.Body.Close()
+
+		switch res.StatusCode {
+		case 200:
+			resBody, err := io.ReadAll(res.Body)
+			if err != nil {
+				return nil, err
+			}
+
+			var props *runtime.Properties
+			if err = json.Unmarshal(resBody, &props); err != nil {
+				return nil, err
+			}
+
+			s.propertiesCacheMutex.Lock()
+			s.propertiesCache[ctx] = props
+			s.propertiesCacheMutex.Unlock()
+
+			return props, nil
+		default:
+			return nil, fmt.Errorf("%d status code", res.StatusCode)
+		}
+	}
+
+	return entry, nil
 }
 
 // @group satori
@@ -297,7 +412,7 @@ func (s *SatoriClient) PropertiesUpdate(ctx context.Context, id string, properti
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(json))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(json))
 	if err != nil {
 		return err
 	}
@@ -337,8 +452,9 @@ func (e *event) setTimestamp() {
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param id(type=string) The identifier of the identity.
 // @param events(type=[]*runtime.Event) An array of events to publish.
+// @param ipAddress(type=string, optional=true, default="") An optional client IP address to pass on to Satori for geo-IP lookup.
 // @return error(error) An optional error value if an error occurred.
-func (s *SatoriClient) EventsPublish(ctx context.Context, id string, events []*runtime.Event) error {
+func (s *SatoriClient) EventsPublish(ctx context.Context, id string, events []*runtime.Event, ipAddress ...string) error {
 	if s.invalidConfig {
 		return runtime.ErrSatoriConfigurationInvalid
 	}
@@ -363,12 +479,19 @@ func (s *SatoriClient) EventsPublish(ctx context.Context, id string, events []*r
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(json))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(json))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
+	if len(ipAddress) > 0 && ipAddress[0] != "" {
+		if ipAddr := net.ParseIP(ipAddress[0]); ipAddr != nil {
+			req.Header.Set("X-Forwarded-For", ipAddr.String())
+		}
+	} else if ipAddr, ok := ctx.Value(runtime.RUNTIME_CTX_CLIENT_IP).(string); ok {
+		req.Header.Set("X-Forwarded-For", ipAddr)
+	}
 
 	res, err := s.httpc.Do(req)
 	if err != nil {
@@ -401,60 +524,77 @@ func (s *SatoriClient) ExperimentsList(ctx context.Context, id string, names ...
 		return nil, runtime.ErrSatoriConfigurationInvalid
 	}
 
-	url := s.url.String() + "/v1/experiment"
+	s.experimentsCacheMutex.RLock()
+	entry, found := s.experimentsCache[ctx]
+	s.experimentsCacheMutex.RUnlock()
 
-	sessionToken, err := s.generateToken(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	if !found {
+		url := s.url.String() + "/v1/experiment"
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
-
-	if len(names) > 0 {
-		q := req.URL.Query()
-		for _, n := range names {
-			q.Set("names", n)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	res, err := s.httpc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	defer res.Body.Close()
-
-	resBody, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	switch res.StatusCode {
-	case 200:
-		var experiments runtime.ExperimentList
-		if err = json.Unmarshal(resBody, &experiments); err != nil {
+		sessionToken, err := s.generateToken(ctx, id)
+		if err != nil {
 			return nil, err
 		}
 
-		return &experiments, nil
-	default:
-		if len(resBody) > 0 {
-			return nil, fmt.Errorf("%d status code: %s", res.StatusCode, string(resBody))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
+
+		if len(names) > 0 {
+			q := req.URL.Query()
+			for _, n := range names {
+				q.Set("names", n)
+			}
+			req.URL.RawQuery = q.Encode()
 		}
 
-		return nil, fmt.Errorf("%d status code", res.StatusCode)
+		res, err := s.httpc.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		defer res.Body.Close()
+
+		resBody, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		switch res.StatusCode {
+		case 200:
+			var experiments *runtime.ExperimentList
+			if err = json.Unmarshal(resBody, &experiments); err != nil {
+				return nil, err
+			}
+
+			s.experimentsCacheMutex.Lock()
+			s.experimentsCache[ctx] = experiments
+			s.experimentsCacheMutex.Unlock()
+
+			return experiments, nil
+		default:
+			if len(resBody) > 0 {
+				return nil, fmt.Errorf("%d status code: %s", res.StatusCode, string(resBody))
+			}
+
+			return nil, fmt.Errorf("%d status code", res.StatusCode)
+		}
 	}
+
+	return entry, nil
+}
+
+type flagCacheEntry struct {
+	Value            unique.Handle[string]
+	ConditionChanged bool
 }
 
 // @group satori
 // @summary List flags.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
-// @param id(type=string) The identifier of the identity.
+// @param id(type=string) The identifier of the identity. Set to empty string to fetch all default flag values.
 // @param names(type=[]string, optional=true, default=[]) Optional list of flag names to filter.
 // @return flags(*runtime.FlagList) The flag list.
 // @return error(error) An optional error value if an error occurred.
@@ -463,53 +603,87 @@ func (s *SatoriClient) FlagsList(ctx context.Context, id string, names ...string
 		return nil, runtime.ErrSatoriConfigurationInvalid
 	}
 
-	url := s.url.String() + "/v1/flag"
+	s.flagsCacheMutex.RLock()
+	entry, found := s.flagsCache[ctx]
+	s.flagsCacheMutex.RUnlock()
 
-	sessionToken, err := s.generateToken(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	if !found {
+		url := s.url.String() + "/v1/flag"
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
-
-	if len(names) > 0 {
-		q := req.URL.Query()
-		for _, n := range names {
-			q.Add("names", n)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	res, err := s.httpc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	defer res.Body.Close()
-	resBody, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	switch res.StatusCode {
-	case 200:
-		var flags runtime.FlagList
-		if err = json.Unmarshal(resBody, &flags); err != nil {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
 			return nil, err
 		}
 
-		return &flags, nil
-	default:
-		if len(resBody) > 0 {
-			return nil, fmt.Errorf("%d status code: %s", res.StatusCode, string(resBody))
+		if id != "" {
+			sessionToken, err := s.generateToken(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
+		} else {
+			req.SetBasicAuth(s.apiKey, "")
 		}
 
-		return nil, fmt.Errorf("%d status code", res.StatusCode)
+		if len(names) > 0 {
+			q := req.URL.Query()
+			for _, n := range names {
+				q.Add("names", n)
+			}
+			req.URL.RawQuery = q.Encode()
+		}
+
+		res, err := s.httpc.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		defer res.Body.Close()
+		resBody, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		switch res.StatusCode {
+		case 200:
+			var flags *runtime.FlagList
+			if err = json.Unmarshal(resBody, &flags); err != nil {
+				return nil, err
+			}
+
+			entries := make(map[string]flagCacheEntry, len(flags.Flags))
+			for _, f := range flags.Flags {
+				cacheEntry := flagCacheEntry{
+					Value:            unique.Make(f.Value),
+					ConditionChanged: f.ConditionChanged,
+				}
+				entries[f.Name] = cacheEntry
+			}
+
+			s.flagsCacheMutex.Lock()
+			s.flagsCache[ctx] = entries
+			s.flagsCacheMutex.Unlock()
+
+			return flags, nil
+		default:
+			if len(resBody) > 0 {
+				return nil, fmt.Errorf("%d status code: %s", res.StatusCode, string(resBody))
+			}
+
+			return nil, fmt.Errorf("%d status code", res.StatusCode)
+		}
 	}
+
+	flagList := make([]*runtime.Flag, 0, len(entry))
+	for flName, flEntry := range entry {
+		flagList = append(flagList, &runtime.Flag{
+			Name:             flName,
+			Value:            flEntry.Value.Value(),
+			ConditionChanged: flEntry.ConditionChanged,
+		})
+	}
+
+	return &runtime.FlagList{Flags: flagList}, nil
 }
 
 // @group satori
@@ -524,52 +698,64 @@ func (s *SatoriClient) LiveEventsList(ctx context.Context, id string, names ...s
 		return nil, runtime.ErrSatoriConfigurationInvalid
 	}
 
-	url := s.url.String() + "/v1/live-event"
+	s.liveEventsCacheMutex.RLock()
+	entry, found := s.liveEventsCache[ctx]
+	s.liveEventsCacheMutex.RUnlock()
 
-	sessionToken, err := s.generateToken(ctx, id)
-	if err != nil {
-		return nil, err
-	}
+	if !found {
+		url := s.url.String() + "/v1/live-event"
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
-
-	if len(names) > 0 {
-		q := req.URL.Query()
-		for _, n := range names {
-			q.Set("names", n)
-		}
-		req.URL.RawQuery = q.Encode()
-	}
-
-	res, err := s.httpc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	defer res.Body.Close()
-	resBody, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	switch res.StatusCode {
-	case 200:
-		var liveEvents runtime.LiveEventList
-		if err = json.Unmarshal(resBody, &liveEvents); err != nil {
+		sessionToken, err := s.generateToken(ctx, id)
+		if err != nil {
 			return nil, err
 		}
 
-		return &liveEvents, nil
-	default:
-		if len(resBody) > 0 {
-			return nil, fmt.Errorf("%d status code: %s", res.StatusCode, string(resBody))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("%d status code", res.StatusCode)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", sessionToken))
+
+		if len(names) > 0 {
+			q := req.URL.Query()
+			for _, n := range names {
+				q.Set("names", n)
+			}
+			req.URL.RawQuery = q.Encode()
+		}
+
+		res, err := s.httpc.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		defer res.Body.Close()
+		resBody, err := io.ReadAll(res.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		switch res.StatusCode {
+		case 200:
+			var liveEvents *runtime.LiveEventList
+			if err = json.Unmarshal(resBody, &liveEvents); err != nil {
+				return nil, err
+			}
+
+			s.liveEventsCacheMutex.Lock()
+			s.liveEventsCache[ctx] = liveEvents
+			s.liveEventsCacheMutex.Unlock()
+
+			return liveEvents, nil
+		default:
+			if len(resBody) > 0 {
+				return nil, fmt.Errorf("%d status code: %s", res.StatusCode, string(resBody))
+			}
+			return nil, fmt.Errorf("%d status code", res.StatusCode)
+		}
 	}
+
+	return entry, nil
 }
 
 // @group satori
@@ -597,7 +783,7 @@ func (s *SatoriClient) MessagesList(ctx context.Context, id string, limit int, f
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -641,6 +827,7 @@ func (s *SatoriClient) MessagesList(ctx context.Context, id string, limit int, f
 // @summary Update message.
 // @param ctx(type=context.Context) The context object represents information about the server and requester.
 // @param id(type=string) The identifier of the identity.
+// @param messageId(type=string) The id of the message.
 // @param readTime(type=int64) The time the message was read at the client.
 // @param consumeTime(type=int64) The time the message was consumed by the identity.
 // @return error(error) An optional error value if an error occurred.
@@ -664,7 +851,7 @@ func (s *SatoriClient) MessageUpdate(ctx context.Context, id, messageId string, 
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(json))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(json))
 	if err != nil {
 		return err
 	}
@@ -712,7 +899,7 @@ func (s *SatoriClient) MessageDelete(ctx context.Context, id, messageId string) 
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return err
 	}

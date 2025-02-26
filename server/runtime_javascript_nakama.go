@@ -48,7 +48,6 @@ import (
 	"github.com/heroiclabs/nakama-common/rtapi"
 	"github.com/heroiclabs/nakama-common/runtime"
 	"github.com/heroiclabs/nakama/v3/internal/cronexpr"
-	"github.com/heroiclabs/nakama/v3/internal/satori"
 	"github.com/heroiclabs/nakama/v3/social"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -88,7 +87,7 @@ type RuntimeJavascriptNakamaModule struct {
 	satori runtime.Satori
 }
 
-func NewRuntimeJavascriptNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, storageIndex StorageIndex, localCache *RuntimeJavascriptLocalCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, eventFn RuntimeEventCustomFunction, matchCreateFn RuntimeMatchCreateFunction) *RuntimeJavascriptNakamaModule {
+func NewRuntimeJavascriptNakamaModule(logger *zap.Logger, db *sql.DB, protojsonMarshaler *protojson.MarshalOptions, protojsonUnmarshaler *protojson.UnmarshalOptions, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, storageIndex StorageIndex, localCache *RuntimeJavascriptLocalCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, statusRegistry StatusRegistry, matchRegistry MatchRegistry, tracker Tracker, metrics Metrics, streamManager StreamManager, router MessageRouter, satoriClient runtime.Satori, eventFn RuntimeEventCustomFunction, matchCreateFn RuntimeMatchCreateFunction) *RuntimeJavascriptNakamaModule {
 	return &RuntimeJavascriptNakamaModule{
 		ctx:                  context.Background(),
 		logger:               logger,
@@ -117,14 +116,7 @@ func NewRuntimeJavascriptNakamaModule(logger *zap.Logger, db *sql.DB, protojsonM
 		eventFn:       eventFn,
 		matchCreateFn: matchCreateFn,
 
-		satori: satori.NewSatoriClient(
-			logger,
-			config.GetSatori().Url,
-			config.GetSatori().ApiKeyName,
-			config.GetSatori().ApiKey,
-			config.GetSatori().SigningKey,
-			config.GetSession().TokenExpirySec,
-		),
+		satori: satoriClient,
 	}
 }
 
@@ -154,7 +146,7 @@ func (n *RuntimeJavascriptNakamaModule) mappings(r *goja.Runtime) map[string]fun
 		"metricsCounterAdd":                    n.metricsCounterAdd(r),
 		"metricsGaugeSet":                      n.metricsGaugeSet(r),
 		"metricsTimerRecord":                   n.metricsTimerRecord(r),
-		"uuidv4":                               n.uuidV4(r),
+		"uuidv4":                               n.uuidv4(r),
 		"cronPrev":                             n.cronPrev(r),
 		"cronNext":                             n.cronNext(r),
 		"sqlExec":                              n.sqlExec(r),
@@ -294,6 +286,7 @@ func (n *RuntimeJavascriptNakamaModule) mappings(r *goja.Runtime) map[string]fun
 		"friendsAdd":                           n.friendsAdd(r),
 		"friendsDelete":                        n.friendsDelete(r),
 		"friendsBlock":                         n.friendsBlock(r),
+		"friendMetadataUpdate":                 n.friendMetadataUpdate(r),
 		"groupUserJoin":                        n.groupUserJoin(r),
 		"groupUserLeave":                       n.groupUserLeave(r),
 		"groupUsersAdd":                        n.groupUsersAdd(r),
@@ -539,7 +532,7 @@ func (n *RuntimeJavascriptNakamaModule) metricsTimerRecord(r *goja.Runtime) func
 // @summary Generate a version 4 UUID in the standard 36-character string representation.
 // @return uuid(string) The newly generated version 4 UUID identifier string.
 // @return error(error) An optional error value if an error occurred.
-func (n *RuntimeJavascriptNakamaModule) uuidV4(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
+func (n *RuntimeJavascriptNakamaModule) uuidv4(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(f goja.FunctionCall) goja.Value {
 		return r.ToValue(uuid.Must(uuid.NewV4()).String())
 	}
@@ -2222,10 +2215,16 @@ func (n *RuntimeJavascriptNakamaModule) usersGetFriendStatus(r *goja.Runtime) fu
 				panic(r.NewGoError(err))
 			}
 
-			fm := make(map[string]interface{}, 3)
+			fm := make(map[string]interface{}, 4)
 			fm["state"] = f.State.Value
 			fm["updateTime"] = f.UpdateTime.Seconds
 			fm["user"] = fum
+			metadata := make(map[string]interface{})
+			if err = json.Unmarshal([]byte(f.Metadata), &metadata); err != nil {
+				panic(r.NewGoError(fmt.Errorf("error while trying to unmarshal friend metadata: %v", err.Error())))
+			}
+			pointerizeSlices(metadata)
+			fm["metadata"] = metadata
 
 			userFriends = append(userFriends, fm)
 		}
@@ -5732,6 +5731,7 @@ func (n *RuntimeJavascriptNakamaModule) leaderboardRecordsListCursorFromRank(r *
 // @param score(type=number, optional=true, default=0) The score to submit.
 // @param subscore(type=number, optional=true, default=0) A secondary subscore parameter for the submission.
 // @param metadata(type=object, optional=true) The metadata you want associated to this submission. Some good examples are weather conditions for a racing game.
+// @param overrideOperator(type=nkruntime.OverrideOperator, optional=true) An override operator for the new record. The accepted values include: 0 (no override), 1 (best), 2 (set), 3 (incr), 4 (decr).
 // @return record(nkruntime.LeaderboardRecord) The newly created leaderboard record.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeJavascriptNakamaModule) leaderboardRecordWrite(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
@@ -7638,10 +7638,16 @@ func (n *RuntimeJavascriptNakamaModule) friendsList(r *goja.Runtime) func(goja.F
 				panic(r.NewGoError(err))
 			}
 
-			fm := make(map[string]interface{}, 3)
+			fm := make(map[string]interface{}, 4)
 			fm["state"] = f.State.Value
 			fm["updateTime"] = f.UpdateTime.Seconds
 			fm["user"] = fum
+			metadata := make(map[string]interface{})
+			if err = json.Unmarshal([]byte(f.Metadata), &metadata); err != nil {
+				panic(r.NewGoError(fmt.Errorf("error while trying to unmarshal friend metadata: %v", err.Error())))
+			}
+			pointerizeSlices(metadata)
+			fm["metadata"] = metadata
 
 			userFriends = append(userFriends, fm)
 		}
@@ -7789,7 +7795,23 @@ func (n *RuntimeJavascriptNakamaModule) friendsAdd(r *goja.Runtime) func(goja.Fu
 		allIDs = append(allIDs, userIDs...)
 		allIDs = append(allIDs, fetchIDs...)
 
-		err = AddFriends(n.ctx, n.logger, n.db, n.tracker, n.router, userID, username, allIDs)
+		metaArg := f.Argument(4)
+		metadata, ok := metaArg.Export().(map[string]any)
+		if !ok {
+			panic(r.NewTypeError("invalid metadata: must be an object"))
+		}
+
+		var metadataStr string
+		if metadata != nil {
+			bytes, err := json.Marshal(metadata)
+			if err != nil {
+				n.logger.Error("Could not marshal metadata", zap.Error(err))
+				panic(r.NewTypeError("failed to marshal metadata: %s", err.Error()))
+			}
+			metadataStr = string(bytes)
+		}
+
+		err = AddFriends(n.ctx, n.logger, n.db, n.tracker, n.router, userID, username, allIDs, metadataStr)
 		if err != nil {
 			panic(r.NewTypeError(err.Error()))
 		}
@@ -7950,7 +7972,38 @@ func (n *RuntimeJavascriptNakamaModule) friendsBlock(r *goja.Runtime) func(goja.
 
 		err = BlockFriends(n.ctx, n.logger, n.db, n.tracker, userID, allIDs)
 		if err != nil {
-			panic(r.NewTypeError(err.Error()))
+			panic(r.NewGoError(fmt.Errorf("error while trying to block friends: %v", err.Error())))
+		}
+
+		return goja.Undefined()
+	}
+}
+
+// @group friends
+// @summary Update friend metadata.
+// @param userId(type=string) The ID of the user.
+// @param userIdFriend(type=string) The ID of the friend of the user.
+// @param metadata(type=object, optional=true) The custom metadata to set for the friend.
+// @return error(error) An optional error value if an error occurred.
+func (n *RuntimeJavascriptNakamaModule) friendMetadataUpdate(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
+	return func(f goja.FunctionCall) goja.Value {
+		uid, err := uuid.FromString(getJsString(r, f.Argument(0)))
+		if err != nil {
+			panic(r.NewTypeError("expects user ID to be a valid identifier"))
+		}
+
+		fuid, err := uuid.FromString(getJsString(r, f.Argument(1)))
+		if err != nil {
+			panic(r.NewTypeError("expects user ID to be a valid identifier"))
+		}
+
+		metadata, ok := f.Argument(2).Export().(map[string]any)
+		if !ok {
+			panic(r.NewTypeError("expects metadata to be an object"))
+		}
+
+		if err := UpdateFriendMetadata(n.ctx, n.logger, n.db, uid, fuid, metadata); err != nil {
+			panic(r.NewGoError(fmt.Errorf("error updating froind metadata: %v", err.Error())))
 		}
 
 		return goja.Undefined()
@@ -7989,7 +8042,7 @@ func (n *RuntimeJavascriptNakamaModule) groupUserJoin(r *goja.Runtime) func(goja
 		}
 
 		if err := JoinGroup(n.ctx, n.logger, n.db, n.tracker, n.router, groupID, userID, username); err != nil {
-			panic(r.NewGoError(fmt.Errorf("error while trying to join group: %v", err.Error())))
+			panic(r.NewGoError(fmt.Errorf("error trying to join group: %v", err.Error())))
 		}
 
 		return goja.Undefined()
@@ -8841,7 +8894,9 @@ func (n *RuntimeJavascriptNakamaModule) getSatori(r *goja.Object) func(goja.Func
 // @summary Create a new identity.
 // @param id(type=string) The identifier of the identity.
 // @param properties(type=nkruntime.AuthPropertiesUpdate, optional=true, default=null) Opt. Properties to update.
+// @param noSession(type=bool, optional=true, default=true) Whether authenticate should skip session tracking.
 // @param ip(type=string, optional=true, default="") An optional client IP address to pass on to Satori for geo-IP lookup.
+// @return properties(nkruntime.Properties)
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeJavascriptNakamaModule) satoriAuthenticate(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(f goja.FunctionCall) goja.Value {
@@ -8866,23 +8921,34 @@ func (n *RuntimeJavascriptNakamaModule) satoriAuthenticate(r *goja.Runtime) func
 			customPropsMap = getJsStringMap(r, r.ToValue(customProps))
 		}
 
+		noSession := true
+		if f.Argument(2) != goja.Undefined() && f.Argument(2) != goja.Null() {
+			noSession = getJsBool(r, f.Argument(2))
+		}
+
 		var ip string
 		if f.Argument(2) != goja.Undefined() && f.Argument(2) != goja.Null() {
 			ip = getJsString(r, f.Argument(2))
 		}
 
-		if err := n.satori.Authenticate(n.ctx, id, defPropsMap, customPropsMap, ip); err != nil {
+		properties, err := n.satori.Authenticate(n.ctx, id, defPropsMap, customPropsMap, noSession, ip)
+		if err != nil {
 			n.logger.Error("Failed to Satori Authenticate.", zap.Error(err))
 			panic(r.NewGoError(fmt.Errorf("failed to satori authenticate: %s", err.Error())))
 		}
-		return nil
+
+		return r.ToValue(map[string]any{
+			"default":  properties.Default,
+			"custom":   properties.Custom,
+			"computed": properties.Computed,
+		})
 	}
 }
 
 // @group satori
 // @summary Get identity properties.
 // @param id(type=string) The identifier of the identity.
-// @return properties(type=nkruntime.Properties) The identity properties.
+// @return properties(nkruntime.Properties) The identity properties.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeJavascriptNakamaModule) satoriPropertiesGet(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(f goja.FunctionCall) goja.Value {
@@ -8948,6 +9014,7 @@ func (n *RuntimeJavascriptNakamaModule) satoriPropertiesUpdate(r *goja.Runtime) 
 // @summary Publish an event.
 // @param id(type=string) The identifier of the identity.
 // @param events(type=nkruntime.Event[]) An array of events to publish.
+// @param ip(type=string, optional=true, default="") An optional client IP address to pass on to Satori for geo-IP lookup.
 // @return error(error) An optional error value if an error occurred.
 func (n *RuntimeJavascriptNakamaModule) satoriPublishEvents(r *goja.Runtime) func(goja.FunctionCall) goja.Value {
 	return func(f goja.FunctionCall) goja.Value {
@@ -9011,7 +9078,12 @@ func (n *RuntimeJavascriptNakamaModule) satoriPublishEvents(r *goja.Runtime) fun
 			evts = append(evts, evt)
 		}
 
-		if err := n.satori.EventsPublish(n.ctx, identifier, evts); err != nil {
+		var ip string
+		if f.Argument(2) != goja.Undefined() && f.Argument(2) != goja.Null() {
+			ip = getJsString(r, f.Argument(2))
+		}
+
+		if err := n.satori.EventsPublish(n.ctx, identifier, evts, ip); err != nil {
 			panic(r.NewGoError(fmt.Errorf("failed to publish satori events: %s", err.Error())))
 		}
 
@@ -9060,7 +9132,7 @@ func (n *RuntimeJavascriptNakamaModule) satoriExperimentsList(r *goja.Runtime) f
 
 // @group satori
 // @summary List flags.
-// @param id(type=string) The identifier of the identity.
+// @param id(type=string) The identifier of the identity. Set to empty string to fetch all default flag values.
 // @param names(type=string[], optional=true, default=[]) Optional list of flag names to filter.
 // @return flags(*nkruntime.Flag[]) The flag list.
 // @return error(error) An optional error value if an error occurred.
@@ -9212,6 +9284,7 @@ func (n *RuntimeJavascriptNakamaModule) satoriMessagesList(r *goja.Runtime) func
 // @group satori
 // @summary Update message.
 // @param id(type=string) The identifier of the identity.
+// @param messageId(type=string) The id of the message.
 // @param readTime(type=int) The time the message was read at the client.
 // @param consumeTime(type=int, optiona=true, default=0) The time the message was consumed by the identity.
 // @return error(error) An optional error value if an error occurred.
